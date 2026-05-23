@@ -500,9 +500,9 @@ export default function App() {
           headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + getApiKey() },
           body: JSON.stringify({
             model: 'grok-4.3',
-            messages: [{ role: 'user', content: [...barImages.map(img => ({ type: 'image_url', image_url: { url: img.dataUrl, detail: 'high' } })), { type: 'text', text: 'You are an expert spirits identifier. Examine these bar shelf photos carefully. CRITICAL: Only identify bottles where you can clearly read the label text. If a label is blurry, angled, or unreadable — SKIP IT entirely, do not guess. It is far better to return fewer accurate results than to hallucinate brands. For clearly readable bottles, include the exact name as written, distillery, expression/style, and age if visible. Return ONLY a JSON array:
-[{"name":"exact name from label","distillery":"distillery","style":"bourbon/scotch/tequila etc","age":"age statement or null","visible_price":null}]
-If you cannot clearly read ANY labels, return an empty array: []'mport React, { useState, useEffect } from 'react'
+            messages: [{ role: 'user', content: [...barImages.map(img => ({ type: 'image_url', image_url: { url: img.dataUrl, detail: 'high' } })), { type: 'text', text: 'You are an expert spirits identifier. STRICT RULES: (1) Only identify a bottle if you can read the brand name AND at least one other detail (distillery, age, or expression) with 100% confidence. (2) If you are even slightly unsure about a bottle — SKIP IT. Do not guess, do not infer, do not hallucinate. (3) It is ALWAYS better to return 2 correct bottles than 5 where 3 are wrong. Return ONLY a JSON array of bottles you are completely certain about:
+[{"name":"exact brand name as written","distillery":"distillery","style":"bourbon/scotch/tequila etc","age":"age statement or null","visible_price":null}]
+If you are not 100% certain about ANY bottle, return: []'mport React, { useState, useEffect } from 'react'
 import { v4 as uuidv4 } from 'uuid'
 import {
   saveSpiritWithRatings, getSpiritsForUsers, fetchAppUsers,
