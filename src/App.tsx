@@ -493,20 +493,78 @@ export default function App() {
       }
 
       if (barImages.length > 0) {
-        setOcrStatus('Identifying bottles from bar photos...')
+        // ── Dual-detection: Vision OCR + Grok vision, cross-referenced ──
+
+        // Step 1: Google Vision OCR on bar photos (reads any visible text)
+        setOcrStatus('Reading bar labels with Google Vision...')
+        const barOcrTexts: string[] = []
+        for (let i = 0; i < barImages.length; i++) {
+          try {
+            const ocrText = await extractTextWithVision(barImages[i].dataUrl)
+            if (ocrText) barOcrTexts.push(ocrText)
+          } catch (err) {
+            console.warn('Vision OCR failed for bar image', i, err)
+          }
+        }
+        const barOcrRaw = barOcrTexts.join(' ')
+
+        // Step 2: Grok vision identifies bottles visually
+        setOcrStatus('Identifying bottles visually with Grok...')
         const barResponse = await fetch('https://api.x.ai/v1/chat/completions', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + getApiKey() },
           body: JSON.stringify({
             model: 'grok-4.3',
-            messages: [{ role: 'user', content: [...barImages.map(img => ({ type: 'image_url', image_url: { url: img.dataUrl, detail: 'high' } })), { type: 'text', text: 'You are an expert spirits identifier. Examine these bar shelf photos carefully. STRICT RULES: Only identify bottles you can read with 100% confidence. Skip any unclear labels. Return fewer correct results over many hallucinated ones. Return ONLY a JSON array:\n[{"name":"full spirit name","distillery":"distillery","style":"bourbon/scotch/tequila etc","age":"age statement or null","visible_price":null}]' }] }],
+            messages: [{ role: 'user', content: [...barImages.map(img => ({ type: 'image_url', image_url: { url: img.dataUrl, detail: 'high' } })), { type: 'text', text: 'You are an expert spirits identifier. STRICT RULES: Only identify bottles you can read with 100% confidence. Skip any unclear labels. Return fewer correct results over many hallucinated ones. Return ONLY a JSON array:\n[{"name":"full spirit name","distillery":"distillery or null","style":"bourbon/scotch/tequila etc","age":"age statement or null"}]\nIf not 100% certain about ANY bottle, return: []' }] }],
             max_tokens: 1000
           })
         })
         const barData = await barResponse.json()
         const barContent = barData.choices?.[0]?.message?.content || '[]'
-        const barSpirits = JSON.parse(barContent.replace(/```json|```/g, '').trim())
-        fullSpiritsList += '\n\nFROM BAR PHOTOS:\n' + barSpirits.map((bs: any) => bs.name + (bs.distillery ? ' by ' + bs.distillery : '') + (bs.age ? ' ' + bs.age : '')).join('\n')
+        const grokSpirits: any[] = JSON.parse(barContent.replace(/```json|```/g, '').trim())
+
+        // Step 3: Cross-reference — score each Grok result against Vision OCR text
+        setOcrStatus('Cross-referencing results for confidence...')
+        const scoredSpirits = grokSpirits.map((spirit: any) => {
+          const nameWords = spirit.name.toLowerCase().split(' ').filter((w: string) => w.length > 2)
+          const ocrLower = barOcrRaw.toLowerCase()
+          // Count how many key words from the spirit name appear in OCR text
+          const matchCount = nameWords.filter((word: string) => ocrLower.includes(word)).length
+          const confidence = nameWords.length > 0 ? matchCount / nameWords.length : 0
+          return { ...spirit, confidence, matchCount }
+        })
+
+        // High confidence = most name words found in OCR (>=0.5 match ratio)
+        // Low confidence = Grok guessed something Vision couldn't read
+        const highConfidence = scoredSpirits.filter((s: any) => s.confidence >= 0.5)
+        const lowConfidence = scoredSpirits.filter((s: any) => s.confidence > 0 && s.confidence < 0.5)
+
+        // Also add any spirits Vision OCR found that Grok missed
+        // Pass raw OCR text as context too
+        const barSpiritLines: string[] = []
+
+        if (highConfidence.length > 0) {
+          barSpiritLines.push('HIGH CONFIDENCE (both Vision + Grok agree):')
+          highConfidence.forEach((s: any) => {
+            barSpiritLines.push('  ✓ ' + s.name + (s.distillery ? ' by ' + s.distillery : '') + (s.age ? ' ' + s.age : ''))
+          })
+        }
+
+        if (lowConfidence.length > 0) {
+          barSpiritLines.push('LOWER CONFIDENCE (Grok detected, Vision partial match):')
+          lowConfidence.forEach((s: any) => {
+            barSpiritLines.push('  ? ' + s.name + (s.distillery ? ' by ' + s.distillery : '') + (s.age ? ' ' + s.age : ''))
+          })
+        }
+
+        if (barOcrRaw.trim()) {
+          barSpiritLines.push('\nRAW TEXT FROM BAR LABELS (Vision OCR — use to verify or find additional spirits):')
+          barSpiritLines.push(barOcrRaw.substring(0, 800)) // cap at 800 chars
+        }
+
+        if (barSpiritLines.length > 0) {
+          fullSpiritsList += '\n\nFROM BAR PHOTOS:\n' + barSpiritLines.join('\n')
+        }
       }
 
       if (!fullSpiritsList.trim()) { alert('Could not read any spirits. Please try clearer photos.'); setScreen('quiz'); return }
@@ -527,6 +585,11 @@ Tonight's preferences: ${preferences}
 
 SPIRITS AVAILABLE (from menu/bar scan — ONLY recommend from this list):
 ${fullSpiritsList}
+
+CONFIDENCE GUIDE (for bar shelf results):
+- Lines starting with ✓ = HIGH CONFIDENCE — both Vision OCR and Grok visual agreed. Safe to recommend.
+- Lines starting with ? = LOWER CONFIDENCE — only partially verified. You may include these but note the uncertainty.
+- RAW TEXT section = additional OCR text from labels. Use this to identify any spirits the visual scan may have missed.
 
 TASK:
 1. Parse the spirits list above
@@ -776,7 +839,7 @@ Return ONLY valid JSON:
               <div style={{ background: '#0A0A1E', borderRadius: '16px', border: '1px solid #4A4A8A', overflow: 'hidden' }}>
                 <button onClick={() => setShowExtracted(p => !p)}
                   style={{ width: '100%', background: 'none', border: 'none', padding: '12px 16px', color: '#A0A0FF', cursor: 'pointer', display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '0.85rem' }}>
-                  <span>🔍 What was found ({extractedSpirits.length} spirits)</span>
+                  <span>🔍 What was found ({extractedSpirits.length} spirits) — ✓ high confidence, ? lower confidence</span>
                   <span>{showExtracted ? '▲' : '▼'}</span>
                 </button>
                 {showExtracted && (
