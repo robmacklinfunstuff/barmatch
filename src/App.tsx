@@ -213,7 +213,514 @@ export default function App() {
     for (const file of files) {
       const reader = new FileReader()
       reader.onload = async () => {
+        // Bar photos need higher quality to read bottle labels
+        const compressed = mode === 'bar'
+          ? await compressImage(reader.result as string, 1200, 0.7)
+          : await compressImage(reader.result as string)
+        setScannedImages(prev => [...prev, { id: uuidv4(), dataUrl: compressed, mode: mode! }])
+      }
+      reader.readAsDataURL(file)
+    }
+    e.target.value = ''
+  }
+
+  const handleLabelFileInput = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    setIsParsingLabel(true)
+    const reader = new FileReader()
+    reader.onload = async () => {
+      try {
         const compressed = await compressImage(reader.result as string)
+        const response = await fetch('https://api.x.ai/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + getApiKey() },
+          body: JSON.stringify({
+            model: 'grok-4.3',
+            messages: [{ role: 'user', content: [
+              { type: 'image_url', image_url: { url: compressed, detail: 'high' } },
+              { type: 'text', text: 'You are a spirits expert. Analyze this bottle label and extract details. Return ONLY valid JSON:\n{"name":"full spirit name","distillery":"distillery","spirit_type":"whiskey/bourbon/scotch/tequila/rum/gin/vodka/brandy/liqueur","whiskey_style":"Single Malt/Blended/Bourbon/Rye/Irish/Japanese/Tennessee/Canadian or null","age_statement":"e.g. 12 Year Old or null","abv":"e.g. 40 or null","country":"country","region":"region or null","tasting_notes":"any notes from label or null"}' }
+            ]}],
+            max_tokens: 500
+          })
+        })
+        const data = await response.json()
+        const content = data.choices?.[0]?.message?.content || '{}'
+        const parsed = JSON.parse(content.replace(/```json|```/g, '').trim())
+        setNewSpirit(prev => ({
+          ...prev,
+          name: parsed.name || prev.name,
+          distillery: parsed.distillery || prev.distillery,
+          spirit_type: parsed.spirit_type || prev.spirit_type,
+          whiskey_style: parsed.whiskey_style || prev.whiskey_style,
+          age_statement: parsed.age_statement || prev.age_statement,
+          abv: parsed.abv || prev.abv,
+          country: parsed.country || prev.country,
+          region: parsed.region || prev.region,
+          tasting_notes: parsed.tasting_notes || prev.tasting_notes,
+        }))
+        setScreen('addSpiritForm')
+      } catch (err) {
+        console.error(err)
+        alert('Could not read label. Please fill in manually.')
+        setScreen('addSpiritForm')
+      } finally {
+        setIsParsingLabel(false)
+      }
+    }
+    reader.readAsDataURL(file)
+    e.target.value = ''
+  }
+
+  const startAddSpirit = () => {
+    setNewSpirit({ name: '', distillery: '', spirit_type: '', whiskey_style: '', age_statement: '', abv: '', country: '', region: '', flavor_profile: '', nose_notes: '', palate_notes: '', finish_notes: '', tasting_notes: '' })
+    const names = users.filter(u => selectedUsers.includes(u.id)).map(u => u.name)
+    setUserRatings(names.map(name => ({ user_name: name, rating: '', value_rating: '', price: '', how_consumed: '', notes: '' })))
+    setRatingUserIndex(0)
+    setScreen('addSpirit')
+  }
+
+  const updateRating = (field: keyof UserRating, value: string) => {
+    setUserRatings(prev => prev.map((r, i) => i === ratingUserIndex ? { ...r, [field]: value } : r))
+  }
+
+  const goToNextRating = async () => {
+    if (ratingUserIndex < userRatings.length - 1) { setRatingUserIndex(i => i + 1) }
+    else { await handleSaveSpirit() }
+  }
+
+  const handleSaveSpirit = async () => {
+    if (!newSpirit.name.trim()) { alert('Please enter at least the spirit name'); return }
+    setIsSaving(true)
+    try {
+      const spiritToSave = { ...newSpirit, abv: newSpirit.abv ? parseFloat(newSpirit.abv) : undefined }
+      const ratingsToSave = userRatings.map(r => ({
+        user_name: r.user_name,
+        rating: r.rating || undefined,
+        value_rating: r.value_rating || undefined,
+        price: r.price ? parseFloat(r.price) : undefined,
+        how_consumed: r.how_consumed || undefined,
+        notes: r.notes || undefined,
+      }))
+      const result = await saveSpiritWithRatings(spiritToSave, ratingsToSave)
+      if (result.success) { alert('Spirit saved! 🥃'); setScreen('home') }
+      else { alert('Error saving. Please try again.') }
+    } catch (err) {
+      console.error(err); alert('Error saving. Please try again.')
+    } finally { setIsSaving(false) }
+  }
+
+  const handleAddUser = async () => {
+    if (!newUserName.trim()) { alert('Please enter a name'); return }
+    setIsAddingUser(true)
+    const result = await addAppUser(newUserName.trim(), newUserKey.trim() || undefined, newUserProfile.trim() || undefined)
+    if (result) { await loadUsers(); setNewUserName(''); setNewUserKey(''); setNewUserProfile(''); alert(newUserName + ' added!') }
+    else { alert('Error adding user.') }
+    setIsAddingUser(false)
+  }
+
+  const handleDeleteUser = async (id: string, name: string) => {
+    if (!confirm('Remove ' + name + '?')) return
+    await deleteAppUser(id); await loadUsers()
+  }
+
+  const handleSaveProfile = async (userId: string, profileText: string) => {
+    await updateUserProfiles(userId, profileText); await loadUsers(); setEditingProfile(null)
+  }
+
+  const handleGenerateSummary = async (user: AppUser) => {
+    setIsGeneratingSummary(user.id)
+    try {
+      const allSpirits = await getSpiritsForUsers([user.name])
+      if (allSpirits.length === 0) { alert('No spirits history yet for ' + user.name + '. Add some first!'); return }
+      const response = await fetch('https://api.x.ai/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + MASTER_API_KEY },
+        body: JSON.stringify({
+          model: 'grok-4.3',
+          messages: [{ role: 'user', content: GROK_PERSONALITY + '\n\nBased on this person\'s spirits history, write a SHORT 2-3 sentence taste profile summary. Be specific about what styles, flavors, and spirits they love and avoid. Make it fun and personal.\n\nSpirits history:\n' + JSON.stringify(allSpirits) + '\n\nReturn ONLY the summary paragraph, no other text.' }],
+          max_tokens: 300
+        })
+      })
+      const data = await response.json()
+      const summary = data.choices?.[0]?.message?.content || ''
+      if (summary) { await generateAndSaveTasteSummary(user.id, summary); await loadUsers(); alert('Taste summary generated for ' + user.name + '!') }
+    } catch (err) { console.error(err); alert('Error generating summary.') }
+    finally { setIsGeneratingSummary(null) }
+  }
+
+  const handleLogoTap = () => {
+    const newCount = logoTapCount + 1
+    setLogoTapCount(newCount)
+    if (newCount >= 3) { setLogoTapCount(0); setScreen('admin') }
+  }
+
+  const resetQuiz = () => {
+    setQuizStep(0); setSpiritType(''); setWhiskeyStyle(''); setFlavorProfile('')
+    setBody(''); setFinish(''); setAgePreference(''); setPeatPreference('')
+    setServing(''); setPriceMin(''); setPriceMax(''); setAdventure(''); setSubStyle('')
+  }
+
+  const buildQuizSteps = () => {
+    const steps: { title: string; content: React.ReactNode }[] = []
+
+    steps.push({
+      title: 'What are you in the mood for?',
+      content: (
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
+          {SPIRIT_TYPES.map(st => (
+            <button key={st.id} onClick={() => setSpiritType(st.id)}
+              style={{ padding: '14px', borderRadius: '14px', border: '2px solid', cursor: 'pointer', background: spiritType === st.id ? '#92400E' : '#2A1F17', borderColor: spiritType === st.id ? '#FCD34D' : '#78350F', color: 'white', fontSize: '0.9rem', fontWeight: 'bold' }}>
+              {st.label}
+            </button>
+          ))}
+        </div>
+      )
+    })
+
+    steps.push({
+      title: 'Are you feeling adventurous?',
+      content: (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+          {['🏠 Something familiar — classic styles I know I like', '🗺️ A bit far afield — interesting but not too out there', '🌍 Very unique — surprise me with something rare'].map(opt =>
+            optionBtn(opt, opt, adventure, setAdventure)
+          )}
+        </div>
+      )
+    })
+
+    if (['whiskey', 'scotch', 'irish', 'japanese', 'rye', 'bourbon'].includes(spiritType)) {
+      steps.push({ title: 'What style of whiskey?', content: (<div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>{WHISKEY_STYLES.map(s => optionBtn(s, s, whiskeyStyle, setWhiskeyStyle))}</div>) })
+      steps.push({ title: 'What flavor profile calls to you?', content: (<div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>{FLAVOR_PROFILES.map(f => optionBtn(f, f, flavorProfile, setFlavorProfile))}</div>) })
+      steps.push({ title: 'How full-bodied?', content: (<div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>{[...BODY_OPTIONS, 'No Preference'].map(b => optionBtn(b, b, body, setBody))}</div>) })
+      steps.push({ title: 'Finish preference?', content: (<div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>{[...FINISH_OPTIONS, 'No Preference'].map(f => optionBtn(f, f, finish, setFinish))}</div>) })
+      steps.push({ title: 'Age preference?', content: (<div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>{AGE_OPTIONS.map(a => optionBtn(a, a, agePreference, setAgePreference))}</div>) })
+      if (PEAT_ELIGIBLE.includes(spiritType) || ['Single Malt', 'Blended', 'Irish', 'Japanese', 'Other'].includes(whiskeyStyle)) {
+        steps.push({ title: 'Peat & smoke preference?', content: (<div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>{PEAT_OPTIONS.map(p => optionBtn(p, p, peatPreference, setPeatPreference))}</div>) })
+      }
+      steps.push({ title: 'How are you drinking it tonight?', content: (<div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>{SERVING_OPTIONS.map(sv => optionBtn(sv, sv, serving, setServing))}</div>) })
+    }
+
+    if (spiritType === 'tequila') {
+      steps.push({ title: 'Tequila style?', content: (<div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>{TEQUILA_STYLES.map(s => optionBtn(s, s, subStyle, setSubStyle))}</div>) })
+      steps.push({ title: 'How are you drinking it?', content: (<div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>{['Sipping neat', 'On the rocks', 'Cocktail (margarita etc)', 'No preference'].map(s => optionBtn(s, s, serving, setServing))}</div>) })
+    }
+
+    if (spiritType === 'mezcal') {
+      steps.push({ title: 'Smoke level?', content: (<div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>{['Light smoke', 'Medium smoke', 'Heavy smoke — the smokier the better', 'No preference'].map(s => optionBtn(s, s, peatPreference, setPeatPreference))}</div>) })
+    }
+
+    if (spiritType === 'rum') {
+      steps.push({ title: 'Rum style?', content: (<div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>{RUM_STYLES.map(s => optionBtn(s, s, subStyle, setSubStyle))}</div>) })
+    }
+
+    if (spiritType === 'gin') {
+      steps.push({ title: 'Gin style?', content: (<div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>{GIN_STYLES.map(s => optionBtn(s, s, subStyle, setSubStyle))}</div>) })
+    }
+
+    steps.push({
+      title: 'Price range per pour?',
+      content: (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+          <div style={{ display: 'flex', gap: '12px', alignItems: 'flex-end' }}>
+            <div style={{ flex: 1 }}>
+              <label style={s.label}>Min ($)</label>
+              <input type="number" value={priceMin} onChange={e => setPriceMin(e.target.value)} placeholder="0" style={s.input} />
+            </div>
+            <span style={{ color: '#FCD34D', paddingBottom: '14px' }}>—</span>
+            <div style={{ flex: 1 }}>
+              <label style={s.label}>Max ($)</label>
+              <input type="number" value={priceMax} onChange={e => setPriceMax(e.target.value)} placeholder="50" style={s.input} />
+            </div>
+          </div>
+          <button onClick={() => { setPriceMin(''); setPriceMax('') }}
+            style={{ background: '#2A1F17', border: '1px solid #78350F', borderRadius: '14px', padding: '14px', color: 'white', cursor: 'pointer' }}>
+            No Price Preference
+          </button>
+        </div>
+      )
+    })
+
+    return steps
+  }
+
+  const callGrok = async () => {
+    if (scannedImages.length === 0) { alert('Please scan or upload a menu or bar photo first!'); return }
+    setIsLoading(true); setRecommendations([]); setWorstPick(null); setScreen('results')
+
+    const selectedUserNamesList = users.filter(u => selectedUsers.includes(u.id)).map(u => u.name)
+    const selectedUserNames = selectedUserNamesList.join(', ')
+    const allSpirits = await getSpiritsForUsers(selectedUserNamesList)
+
+    const selectedUserObjects = users.filter(u => selectedUsers.includes(u.id))
+    const userContext = selectedUserObjects.map(u => {
+      const parts = ['User: ' + u.name]
+      if (u.taste_profile) parts.push('Their own description: "' + u.taste_profile + '"')
+      if (u.taste_summary) parts.push('AI taste summary: "' + u.taste_summary + '"')
+      return parts.join('\n')
+    }).join('\n\n')
+
+    const spiritLabel = SPIRIT_TYPES.find(st => st.id === spiritType)?.label || spiritType
+    const preferences = [
+      'Spirit type: ' + (spiritLabel || 'no preference'),
+      whiskeyStyle ? 'Whiskey style: ' + whiskeyStyle : '',
+      subStyle ? 'Style: ' + subStyle : '',
+      flavorProfile ? 'Flavor profile: ' + flavorProfile : '',
+      body ? 'Body: ' + body : '',
+      finish ? 'Finish: ' + finish : '',
+      agePreference ? 'Age: ' + agePreference : '',
+      peatPreference ? 'Peat/smoke: ' + peatPreference : '',
+      serving ? 'Serving: ' + serving : '',
+      adventure ? 'Adventurousness: ' + adventure : '',
+      priceMin && priceMax ? 'Price range: $' + priceMin + '-$' + priceMax : '',
+    ].filter(Boolean).join(', ')
+
+    const spiritsHistory = allSpirits.length > 0 ? 'Past spirits ratings:\n' + JSON.stringify(allSpirits) : 'No past spirits history — rely on stated preferences.'
+    const menuImages = scannedImages.filter(i => i.mode === 'menu')
+    const barImages = scannedImages.filter(i => i.mode === 'bar')
+
+    try {
+      let fullSpiritsList = ''
+
+      if (menuImages.length > 0) {
+        setOcrStatus('Reading spirits menu with Google Vision...')
+        const ocrTexts: string[] = []
+        for (let i = 0; i < menuImages.length; i++) {
+          setOcrStatus('Reading page ' + (i + 1) + ' of ' + menuImages.length + '...')
+          const text = await extractTextWithVision(menuImages[i].dataUrl)
+          if (text) ocrTexts.push(text)
+        }
+        fullSpiritsList += ocrTexts.join('\n\n--- NEXT PAGE ---\n\n')
+      }
+
+      if (barImages.length > 0) {
+        setOcrStatus('Identifying bottles from bar photos...')
+        const barResponse = await fetch('https://api.x.ai/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + getApiKey() },
+          body: JSON.stringify({
+            model: 'grok-4.3',
+            messages: [{ role: 'user', content: [...barImages.map(img => ({ type: 'image_url', image_url: { url: img.dataUrl, detail: 'high' } })), { type: 'text', text: 'You are an expert spirits identifier. Examine these bar shelf photos carefully. CRITICAL: Only identify bottles where you can clearly read the label text. If a label is blurry, angled, or unreadable — SKIP IT entirely, do not guess. It is far better to return fewer accurate results than to hallucinate brands. For clearly readable bottles, include the exact name as written, distillery, expression/style, and age if visible. Return ONLY a JSON array:
+[{"name":"exact name from label","distillery":"distillery","style":"bourbon/scotch/tequila etc","age":"age statement or null","visible_price":null}]
+If you cannot clearly read ANY labels, return an empty array: []'mport React, { useState, useEffect } from 'react'
+import { v4 as uuidv4 } from 'uuid'
+import {
+  saveSpiritWithRatings, getSpiritsForUsers, fetchAppUsers,
+  addAppUser, deleteAppUser, updateUserProfiles, generateAndSaveTasteSummary
+} from './supabase'
+
+const MASTER_API_KEY = import.meta.env.VITE_GROK_API_KEY || ''
+const VISION_API_KEY = import.meta.env.VITE_GOOGLE_VISION_KEY || ''
+
+const GROK_PERSONALITY = `You are a world-class spirits expert and bartender with a fun, sassy, opinionated personality. You know everything about whiskey, bourbon, scotch, tequila, mezcal, rum, gin, vodka, and all other spirits. You are confident, use light humor, and are not afraid to be dramatic about bad choices. Think knowledgeable best friend at a bar, not stuffy sommelier. Keep it fun but always back up your opinions with real spirits knowledge.`
+
+interface AppUser {
+  id: string
+  name: string
+  grok_api_key?: string
+  is_admin?: boolean
+  taste_profile?: string
+  taste_summary?: string
+}
+
+interface ScannedImage {
+  id: string
+  dataUrl: string
+  mode: 'menu' | 'bar'
+}
+
+interface Recommendation {
+  spirit_name: string
+  distillery?: string
+  age_statement?: string
+  price?: number
+  retail_price?: number
+  similarity_score: number
+  why_it_matches: string
+  similar_to?: string
+  tasting_notes: string
+  potential_drawbacks?: string
+}
+
+interface WorstPick {
+  spirit_name: string
+  distillery?: string
+  price?: number
+  why_its_bad: string
+}
+
+interface NewSpirit {
+  name: string
+  distillery: string
+  spirit_type: string
+  whiskey_style: string
+  age_statement: string
+  abv: string
+  country: string
+  region: string
+  flavor_profile: string
+  nose_notes: string
+  palate_notes: string
+  finish_notes: string
+  tasting_notes: string
+}
+
+interface UserRating {
+  user_name: string
+  rating: string
+  value_rating: string
+  price: string
+  how_consumed: string
+  notes: string
+}
+
+type Screen = 'startup' | 'home' | 'scan' | 'quiz' | 'results' | 'addSpirit' | 'addSpiritForm' | 'rateSpirit' | 'admin'
+type ScanMode = 'menu' | 'bar' | null
+
+const SPIRIT_TYPES = [
+  { id: 'whiskey', label: '🥃 Whiskey', emoji: '🥃' },
+  { id: 'bourbon', label: '🌽 Bourbon', emoji: '🌽' },
+  { id: 'scotch', label: '🏔️ Scotch', emoji: '🏔️' },
+  { id: 'irish', label: '☘️ Irish Whiskey', emoji: '☘️' },
+  { id: 'japanese', label: '🎌 Japanese Whisky', emoji: '🎌' },
+  { id: 'rye', label: '🌾 Rye Whiskey', emoji: '🌾' },
+  { id: 'tequila', label: '🌵 Tequila', emoji: '🌵' },
+  { id: 'mezcal', label: '🔥 Mezcal', emoji: '🔥' },
+  { id: 'agave', label: '🌿 Other Agave', emoji: '🌿' },
+  { id: 'rum', label: '🍹 Rum', emoji: '🍹' },
+  { id: 'gin', label: '🌲 Gin', emoji: '🌲' },
+  { id: 'vodka', label: '🧊 Vodka', emoji: '🧊' },
+  { id: 'brandy', label: '🍇 Brandy & Cognac', emoji: '🍇' },
+  { id: 'liqueur', label: '🍑 Liqueurs & Digestifs', emoji: '🍑' },
+  { id: 'surprise', label: '🎲 Surprise Me!', emoji: '🎲' },
+]
+
+const WHISKEY_STYLES = ['Single Malt', 'Blended', 'Bourbon', 'Rye', 'Irish', 'Japanese', 'Tennessee', 'Canadian', 'Other']
+const FLAVOR_PROFILES = ['🍯 Sweet & Vanilla', '🍎 Fruity & Floral', '🌶️ Spicy & Peppery', '🌫️ Smoky & Peaty', '🪵 Rich & Oaky', '🌰 Nutty & Dry', '🍫 Dark Chocolate & Rich', '🍋 Light & Citrusy']
+const BODY_OPTIONS = ['Light', 'Medium', 'Full & Bold']
+const FINISH_OPTIONS = ['Short & Clean', 'Medium', 'Long & Warming']
+const AGE_OPTIONS = ['Young & Vibrant (under 12yr)', 'Mature (12-18yr)', 'Well Aged (18yr+)', 'No Preference']
+const PEAT_OPTIONS = ['No Peat — Keep it clean', 'A little smoke', 'Heavily Peated — Bring it on']
+const SERVING_OPTIONS = ['Neat', 'On the Rocks', 'With a splash of water', 'Cocktail']
+const TEQUILA_STYLES = ['Blanco', 'Reposado', 'Añejo', 'Extra Añejo', 'No Preference']
+const RUM_STYLES = ['White / Light', 'Gold / Aged', 'Dark & Rich', 'Spiced', 'Agricole / Rhum']
+const GIN_STYLES = ['Classic London Dry', 'Contemporary / Floral', 'Navy Strength', 'Old Tom', 'No Preference']
+const COUNTRIES = ['USA', 'Scotland', 'Ireland', 'Japan', 'Canada', 'Mexico', 'Caribbean', 'France', 'Other']
+const RATINGS = ['Amazing', 'Good', 'Fine', 'Bad']
+const VALUE_RATINGS = ['Great Value', 'Fairly Priced', 'Overrated']
+const PEAT_ELIGIBLE = ['scotch', 'irish', 'japanese', 'whiskey']
+
+function compressImage(dataUrl: string, maxWidth = 500, quality = 0.35): Promise<string> {
+  return new Promise(resolve => {
+    const img = new Image()
+    img.onload = () => {
+      const scale = Math.min(1, maxWidth / img.width)
+      const canvas = document.createElement('canvas')
+      canvas.width = img.width * scale
+      canvas.height = img.height * scale
+      const ctx = canvas.getContext('2d')!
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height)
+      resolve(canvas.toDataURL('image/jpeg', quality))
+    }
+    img.src = dataUrl
+  })
+}
+
+async function extractTextWithVision(dataUrl: string): Promise<string> {
+  const base64 = dataUrl.split(',')[1]
+  if (!base64) throw new Error('No base64 data in image')
+  const response = await fetch(
+    `https://vision.googleapis.com/v1/images:annotate?key=${VISION_API_KEY}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        requests: [{ image: { content: base64 }, features: [{ type: 'DOCUMENT_TEXT_DETECTION', maxResults: 1 }] }]
+      })
+    }
+  )
+  const data = await response.json()
+  const visionError = data.error || data.responses?.[0]?.error
+  if (visionError) throw new Error('Vision: ' + visionError.code + ' ' + visionError.message)
+  return data.responses?.[0]?.fullTextAnnotation?.text || ''
+}
+
+export default function App() {
+  const [screen, setScreen] = useState<Screen>('startup')
+  const [users, setUsers] = useState<AppUser[]>([])
+  const [usersLoading, setUsersLoading] = useState(true)
+  const [selectedUsers, setSelectedUsers] = useState<string[]>([])
+  const [scannedImages, setScannedImages] = useState<ScannedImage[]>([])
+
+  const [spiritType, setSpiritType] = useState('')
+  const [whiskeyStyle, setWhiskeyStyle] = useState('')
+  const [flavorProfile, setFlavorProfile] = useState('')
+  const [body, setBody] = useState('')
+  const [finish, setFinish] = useState('')
+  const [agePreference, setAgePreference] = useState('')
+  const [peatPreference, setPeatPreference] = useState('')
+  const [serving, setServing] = useState('')
+  const [priceMin, setPriceMin] = useState('')
+  const [priceMax, setPriceMax] = useState('')
+  const [adventure, setAdventure] = useState('')
+  const [subStyle, setSubStyle] = useState('')
+  const [quizStep, setQuizStep] = useState(0)
+
+  const [recommendations, setRecommendations] = useState<Recommendation[]>([])
+  const [worstPick, setWorstPick] = useState<WorstPick | null>(null)
+  const [extractedSpirits, setExtractedSpirits] = useState<any[]>([])
+  const [isLoading, setIsLoading] = useState(false)
+  const [ocrStatus, setOcrStatus] = useState('')
+  const [showExtracted, setShowExtracted] = useState(false)
+  const [priceFilter, setPriceFilter] = useState<{ min: number; max: number } | null>(null)
+
+  const [newSpirit, setNewSpirit] = useState<NewSpirit>({
+    name: '', distillery: '', spirit_type: '', whiskey_style: '', age_statement: '',
+    abv: '', country: '', region: '', flavor_profile: '', nose_notes: '',
+    palate_notes: '', finish_notes: '', tasting_notes: ''
+  })
+  const [userRatings, setUserRatings] = useState<UserRating[]>([])
+  const [ratingUserIndex, setRatingUserIndex] = useState(0)
+  const [isSaving, setIsSaving] = useState(false)
+  const [isParsingLabel, setIsParsingLabel] = useState(false)
+
+  const [newUserName, setNewUserName] = useState('')
+  const [newUserKey, setNewUserKey] = useState('')
+  const [newUserProfile, setNewUserProfile] = useState('')
+  const [logoTapCount, setLogoTapCount] = useState(0)
+  const [isAddingUser, setIsAddingUser] = useState(false)
+  const [editingProfile, setEditingProfile] = useState<{ id: string; text: string } | null>(null)
+  const [isGeneratingSummary, setIsGeneratingSummary] = useState<string | null>(null)
+  const [showHelp, setShowHelp] = useState(false)
+
+  useEffect(() => { loadUsers() }, [])
+
+  const loadUsers = async () => {
+    setUsersLoading(true)
+    const data = await fetchAppUsers()
+    setUsers(data)
+    setUsersLoading(false)
+  }
+
+  const getApiKey = () => {
+    const selected = users.filter(u => selectedUsers.includes(u.id))
+    for (const user of selected) { if (user.grok_api_key) return user.grok_api_key }
+    return MASTER_API_KEY
+  }
+
+  const toggleSelectUser = (id: string) => {
+    setSelectedUsers(prev => prev.includes(id) ? prev.filter(u => u !== id) : [...prev, id])
+  }
+
+  const handleFileInput = async (e: React.ChangeEvent<HTMLInputElement>, mode: ScanMode) => {
+    const files = Array.from(e.target.files || [])
+    for (const file of files) {
+      const reader = new FileReader()
+      reader.onload = async () => {
+        // Bar photos need higher quality to read bottle labels
+        const compressed = mode === 'bar'
+          ? await compressImage(reader.result as string, 1200, 0.7)
+          : await compressImage(reader.result as string)
         setScannedImages(prev => [...prev, { id: uuidv4(), dataUrl: compressed, mode: mode! }])
       }
       reader.readAsDataURL(file)
@@ -693,7 +1200,8 @@ Return ONLY valid JSON:
         <label style={{ width: '100%', background: '#1A1200', border: '2px solid #92400E', borderRadius: '20px', padding: '28px 24px', color: 'white', fontSize: '1.1rem', fontWeight: 'bold', cursor: 'pointer', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '8px', boxSizing: 'border-box' as const }}>
           <span style={{ fontSize: '2.5rem' }}>🍾</span>
           Photograph the Bar Shelf
-          <span style={{ fontSize: '0.8rem', fontWeight: 'normal', color: '#FCD34D' }}>Grok identifies bottles from the photo</span>
+          <span style={{ fontSize: '0.8rem', fontWeight: 'normal', color: '#FCD34D' }}>Zoom in close — 4-6 bottles per photo works best</span>
+          <span style={{ fontSize: '0.75rem', fontWeight: 'normal', color: '#92400E' }}>Take multiple close-up shots, not one wide shelf photo</span>
           <input type="file" accept="image/jpeg,image/png" capture="environment" onChange={e => handleFileInput(e, 'bar')} style={{ display: 'none' }} />
         </label>
         {scannedImages.length > 0 && (
